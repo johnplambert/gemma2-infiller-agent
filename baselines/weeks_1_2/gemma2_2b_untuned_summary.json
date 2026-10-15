@@ -1,0 +1,81 @@
+{
+  "timestamp": "2026-10-14 21:17:18",
+  "total_tasks": 12,
+  "passed": 0,
+  "failed": 12,
+  "mode": "agent",
+  "results": [
+    {
+      "instance_id": "fastapi_15661",
+      "status": "FAIL",
+      "duration": 3.94,
+      "error": "Non-zero exit code: 2"
+    },
+    {
+      "instance_id": "fastapi_15588",
+      "status": "FAIL",
+      "duration": 3.71,
+      "error": "Non-zero exit code: 2"
+    },
+    {
+      "instance_id": "fastapi_15589",
+      "status": "FAIL",
+      "duration": 3.68,
+      "error": "Non-zero exit code: 2"
+    },
+    {
+      "instance_id": "fastapi_15030",
+      "status": "FAIL",
+      "duration": 3.65,
+      "error": "Non-zero exit code: 2"
+    },
+    {
+      "instance_id": "fastapi_14962",
+      "status": "FAIL",
+      "duration": 3.59,
+      "error": "Non-zero exit code: 2"
+    },
+    {
+      "instance_id": "fastapi_15280",
+      "status": "FAIL",
+      "duration": 3.58,
+      "error": "Non-zero exit code: 2"
+    },
+    {
+      "instance_id": "fastapi_14964",
+      "status": "FAIL",
+      "duration": 3.43,
+      "error": "Non-zero exit code: 2"
+    },
+    {
+      "instance_id": "fastapi_15023",
+      "status": "FAIL",
+      "duration": 3.47,
+      "error": "Non-zero exit code: 2"
+    },
+    {
+      "instance_id": "fastapi_14986",
+      "status": "FAIL",
+      "duration": 3.38,
+      "error": "Non-zero exit code: 2"
+    },
+    {
+      "instance_id": "fastapi_14978",
+      "status": "FAIL",
+      "duration": 3.51,
+      "error": "Non-zero exit code: 2"
+    },
+    {
+      "instance_id": "requests_7505",
+      "status": "FAIL",
+      "duration": 2.15,
+      "error": "Non-zero exit code: 2"
+    },
+    {
+      "instance_id": "requests_7502",
+      "status": "FAIL",
+      "duration": 2.17,
+      "error": "Non-zero exit code: 2"
+    }
+  ]
+}
