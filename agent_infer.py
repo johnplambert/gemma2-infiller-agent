@@ -94,8 +94,52 @@ def extract_diff(text: str, target_file: str = None) -> str:
         diff_text = re.sub(r"^\+\+\+ (?:b/)?[a-zA-Z0-9_\-\./]*target_file\.py", f"+++ b/{target_file}", diff_text, flags=re.MULTILINE)
 
     # Normalize requests paths from a/requests/ or requests/ to a/src/requests/
-    diff_text = re.sub(r"^--- (?:a/)?requests/", "--- a/src/requests/", diff_text, flags=re.MULTILINE)
-    diff_text = re.sub(r"^\+\+\+ (?:b/)?requests/", "+++ b/src/requests/", diff_text, flags=re.MULTILINE)
+    # diff_text = re.sub(r"^--- (?:a/)?requests/", "--- a/src/requests/", diff_text, flags=re.MULTILINE)
+    # diff_text = re.sub(r"^\+\+\+ (?:b/)?requests/", "+++ b/src/requests/", diff_text, flags=re.MULTILINE)
+
+    # 1. Strip markdown fences if present
+    match = re.search(r"```(?:diff)?\s*\n(.*?)```", text, re.DOTALL)
+    diff_text = match.group(1).strip() if match else text.strip()
+
+    # 2. Slice to the start of the first diff header
+    if "--- " in diff_text:
+        diff_text = diff_text[diff_text.find("--- "):].strip()
+    elif "diff --git" in diff_text:
+        diff_text = diff_text[diff_text.find("diff --git"):].strip()
+
+    # 3. Normalize requests paths to src/requests/
+    diff_text = re.sub(r"^--- (?:a/)?(?:src/)?requests/", "--- a/src/requests/", diff_text, flags=re.MULTILINE)
+    diff_text = re.sub(r"^\+\+\+ (?:b/)?(?:src/)?requests/", "+++ b/src/requests/", diff_text, flags=re.MULTILINE)
+    diff_text = re.sub(r"^--- (?!a/)(?=[^\s\n])", "--- a/", diff_text, flags=re.MULTILINE)
+    diff_text = re.sub(r"^\+\+\+ (?!b/)(?=[^\s\n])", "+++ b/", diff_text, flags=re.MULTILINE)
+
+    # 4. Ensure leading a/ and b/ exist for any paths missing them
+    diff_text = re.sub(r"^--- (?!a/)(?=[^\s\n])", "--- a/", diff_text, flags=re.MULTILINE)
+    diff_text = re.sub(r"^\+\+\+ (?!b/)(?=[^\s\n])", "+++ b/", diff_text, flags=re.MULTILINE)
+
+    # 5. Sanitize lines inside hunks: empty lines MUST have a leading space
+    sanitized_lines = []
+    in_hunk = False
+    for line in diff_text.splitlines():
+        if line.startswith("@@ "):
+            in_hunk = True
+            sanitized_lines.append(line)
+        elif in_hunk:
+            if line.startswith("--- ") or line.startswith("diff --git"):
+                in_hunk = False
+                sanitized_lines.append(line)
+            elif len(line) == 0:
+                # Turn bare blank line into valid context line
+                sanitized_lines.append(" ")
+            elif line[0] not in (" ", "+", "-", "\\"):
+                # Missing leading space on context line
+                sanitized_lines.append(" " + line)
+            else:
+                sanitized_lines.append(line)
+        else:
+            sanitized_lines.append(line)
+
+    diff_text = "\n".join(sanitized_lines)
 
     if not diff_text.endswith("\n"):
         diff_text += "\n"
@@ -144,11 +188,8 @@ def main():
 
     repo_context = extract_repo_context(snapshot_path, target_files)
 
-    target_file_str = target_files[0] if target_files else "the relevant file"
     problem_desc = task.get("problem_statement", "")
-
-# Determine the primary relative path from target_files or repo_context
-    primary_file = target_files[-1] if target_files else "target_file.py"
+    target_files_formatted = ", ".join(f"`{f}`" for f in target_files) if target_files else "the target files"
 
     prompt = (
         f"You are an expert Python software engineer repairing {repo_name}.\n"
@@ -157,22 +198,25 @@ def main():
         f"### Target Source Context:\n{repo_context}\n\n"
         f"### Instructions:\n"
         f"1. Generate ONLY a valid unified git diff patch enclosed in a single ```diff code block.\n"
-        f"2. The diff headers MUST use the exact file path: `--- a/{primary_file}` and `+++ b/{primary_file}`.\n"
-        f"3. Do NOT include placeholder comments like '# ...' or '# rest of code remains unchanged'.\n"
-        f"4. Do NOT include markdown explanations before or after the diff block.\n"
-        f"5. Ensure valid Python indentation and syntax within all modified lines.\n\n"
+        f"2. You may modify one or more of these target files: {target_files_formatted}.\n"
+        f"3. For each file you modify, output standard unified diff headers using the exact relative path:\n"
+        f"   --- a/<exact_path>\n"
+        f"   +++ b/<exact_path>\n"
+        f"4. Do NOT use placeholder file names like 'your_file.py' or 'target_file.py'.\n"
+        f"5. Do NOT include placeholder comments like '# ...' or '# rest of code remains unchanged'.\n"
+        f"6. Maintain valid Python syntax and indentation on all lines.\n\n"
         f"Output format:\n"
         f"```diff\n"
-        f"--- a/{primary_file}\n"
-        f"+++ b/{primary_file}\n"
-        f"@@ ... @@\n"
+        f"--- a/<path>\n"
+        f"+++ b/<path>\n"
+        f"@@ -line,count +line,count @@\n"
         f"<diff lines>\n"
         f"```"
     )
 
     print(f"[+] Querying {args.model} with grounded context for {args.task_id}...")
     response_text = query_ollama(prompt, args.model, args.ollama_url)
-    patch_content = extract_diff(response_text, primary_file) 
+    patch_content = extract_diff(response_text) 
 
     out_file = Path(args.output)
     out_file.parent.mkdir(parents=True, exist_ok=True)
