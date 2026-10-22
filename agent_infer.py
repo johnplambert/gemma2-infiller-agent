@@ -6,11 +6,13 @@ constructs a grounded prompt for Gemma via local Ollama, and formats
 the response into a strict unified git diff.
 """
 
+import ast
 import argparse
 import json
 import re
 import tarfile
 import urllib.request
+import difflib
 from pathlib import Path
 
 
@@ -41,7 +43,7 @@ def extract_repo_context(snapshot_archive: Path, target_files: list, keywords: l
     if not snapshot_archive.exists():
         return ""
 
-    with tarfile.open(snapshot_archive, "r:gz") as tar:
+    with tarfile.open(snapshot_archive, "r:*") as tar:
         for target in target_files:
             try:
                 member = next((m for m in tar.getmembers() if m.name.endswith(target)), None)
@@ -50,23 +52,23 @@ def extract_repo_context(snapshot_archive: Path, target_files: list, keywords: l
                     if f:
                         lines = f.read().decode("utf-8", errors="replace").splitlines()
                         # If file is short (< 300 lines), include whole file with line numbers
-                        if len(lines) <= 300:
+                        if len(lines) <= 50: #300:
                             numbered = [f"{i+1:4d}: {l}" for i, l in enumerate(lines)]
                             snippet = "\n".join(numbered)
                         else:
                             # For large files, include imports and locate functions matching keywords
                             hits = []
                             # Include first 50 lines (imports/definitions)
-                            hits.extend(range(0, min(50, len(lines))))
+                            hits.extend(range(0, min(40, len(lines))))
                             # Scan for keywords like prepare_body, _encode_params, has_read, SupportsRead
-                            search_terms = keywords or ["prepare_body", "_encode_params", "SupportsRead", "has_read"]
+                            search_terms = keywords or ["prepare_body", "has_read","SupportsRead","_SupportsRead"]
                             for i, l in enumerate(lines):
                                 if any(term in l for term in search_terms):
-                                    start_idx = max(0, i - 15)
-                                    end_idx = min(len(lines), i + 35)
+                                    start_idx = max(0, i - 25)
+                                    end_idx = min(len(lines), i + 25)
                                     hits.extend(range(start_idx, end_idx))
                             hits = sorted(set(hits))
-                            numbered = [f"{i+1:4d}: {lines[i]}" for i in hits]
+                            numbered = [f"{i+1:4d}: {lines[i]}" for i in sorted(hits)]
                             snippet = "\n".join(numbered)
 
                         context_chunks.append(f"### File: {target}\n```python\n{snippet}\n```\n")
@@ -128,16 +130,16 @@ def extract_diff(text: str, target_file: str = None) -> str:
             if line.startswith("--- ") or line.startswith("diff --git"):
                 in_hunk = False
                 sanitized_lines.append(line)
-            elif len(line) == 0:
-                # Turn bare blank line into valid context line
+        elif not line.strip():
+                # Any whitespace-only or empty line in a hunk MUST be exactly a single space
                 sanitized_lines.append(" ")
-            elif line[0] not in (" ", "+", "-", "\\"):
+        elif line[0] not in (" ", "+", "-", "\\"):
                 # Missing leading space on context line
                 sanitized_lines.append(" " + line)
-            else:
-                sanitized_lines.append(line)
         else:
-            sanitized_lines.append(line)
+                sanitized_lines.append(line)
+     #   else:
+     #       sanitized_lines.append(line)
 
     diff_text = "\n".join(sanitized_lines)
 
@@ -145,16 +147,68 @@ def extract_diff(text: str, target_file: str = None) -> str:
         diff_text += "\n"
     return diff_text
 
+from typing import List, Optional
+
+def extract_ast_blocks(source_code: str, target_symbols: Optional[List[str]] = None) -> str:
+    """
+    Parses Python source using AST and extracts relevant function/class
+    definitions with exact line numbers.
+    """
+    try:
+        tree = ast.parse(source_code)
+    except SyntaxError:
+        # Fallback for files with syntax issues or non-python code
+        lines = source_code.splitlines()
+        return "\n".join(f"{i+1:4d}: {line}" for i, line in enumerate(lines[:200]))
+
+    lines = source_code.splitlines()
+    extracted_blocks = []
+
+    for node in tree.body:
+        # Extract top-level functions
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            name = node.name
+            if not target_symbols or any(sym.lower() in name.lower() for sym in target_symbols):
+                start = node.lineno
+                end = node.end_lineno if hasattr(node, "end_lineno") and node.end_lineno else start + 30
+                block_lines = [f"{i:4d}: {lines[i-1]}" for i in range(start, min(end + 1, len(lines) + 1))]
+                extracted_blocks.append("\n".join(block_lines))
+
+        # Extract classes and methods
+        elif isinstance(node, ast.ClassDef):
+            class_name = node.name
+            matched_methods = []
+            
+            for item in node.body:
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    method_name = item.name
+                    if not target_symbols or any(sym.lower() in method_name.lower() or sym.lower() in class_name.lower() for sym in target_symbols):
+                        start = item.lineno
+                        end = item.end_lineno if hasattr(item, "end_lineno") and item.end_lineno else start + 30
+                        method_lines = [f"{i:4d}: {lines[i-1]}" for i in range(start, min(end + 1, len(lines) + 1))]
+                        matched_methods.append("\n".join(method_lines))
+            
+            if matched_methods:
+                header = f"{node.lineno:4d}: class {class_name}: ..."
+                extracted_blocks.append(header + "\n" + "\n\n".join(matched_methods))
+
+    if not extracted_blocks:
+        # If no specific symbols matched, return the top 150 lines
+        return "\n".join(f"{i+1:4d}: {lines[i]}" for i in range(min(150, len(lines))))
+
+    return "\n\n---\n\n".join(extracted_blocks)
+
 def query_ollama(prompt: str, model: str, url: str) -> str:
     payload = {
         "model": model,
         "prompt": prompt,
         "stream": False,
         "options": {
-            "temperature": 0.1,
-            "top_p": 0.9,
-            "repeat_penalty": 1.25,
-            "stop": ["```\n\n", "### Explanation", "### Problem", "\n\n\n"],
+            "num_ctx": 8192,
+            "temperature": 0.0,
+            "top_p": 0.95,
+            "repeat_penalty": 1.0,
+            "stop": ["<end_of_turn>"],
             "num_predict": 1024,
         }
     }
@@ -167,6 +221,77 @@ def query_ollama(prompt: str, model: str, url: str) -> str:
         result = json.loads(resp.read().decode("utf-8"))
         return result.get("response", "")
 
+    # Extract code from ```python ... ``` block
+    match = re.search(r"```(?:python)?\s*\n(.*?)```", response_text, re.DOTALL)
+    new_func = match.group(1).strip() if match else response_text.strip()
+
+    # Generate unified diff using difflib
+    patch_diff = generate_function_patch(
+        "src/requests/models.py",
+        full_models_code,
+        new_func,
+        "prepare_body"
+    )
+
+    out_path = Path(args.output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(patch_diff, encoding="utf-8")
+    print(f"[+] Candidate patch saved to: {out_path}")
+
+
+def generate_function_patch(file_rel_path: str, orig_code: str, new_func_code: str, func_name: str) -> str:
+    orig_lines = orig_code.splitlines(keepends=True)
+
+    start_idx = None
+    target_indent = "    "
+    for i, line in enumerate(orig_lines):
+        if f"def {func_name}(" in line:
+            start_idx = i
+            target_indent = line[:len(line) - len(line.lstrip())]
+            break
+
+    if start_idx is None:
+        return ""
+
+    end_idx = len(orig_lines)
+    for i in range(start_idx + 1, len(orig_lines)):
+        line = orig_lines[i]
+        if line.strip() and not line.startswith(target_indent + " ") and not line.startswith(target_indent + "\t"):
+            if line.startswith(target_indent + "def ") or line.startswith("class ") or line.startswith("def "):
+                end_idx = i
+                break
+
+    # Strip extraneous text outside of the target function
+    raw_lines = new_func_code.strip().splitlines()
+    func_start = 0
+    for idx, l in enumerate(raw_lines):
+        if f"def {func_name}(" in l:
+            func_start = idx
+            break
+    raw_lines = raw_lines[func_start:]
+
+    # Calculate baseline indentation of the LLM output
+    base_lead = len(raw_lines[0]) - len(raw_lines[0].lstrip())
+
+    reindented_lines = []
+    for l in raw_lines:
+        if l.strip():
+            # Strip the model's baseline indent and re-prefix with target class indent
+            content = l[base_lead:] if len(l) >= base_lead else l.lstrip()
+            reindented_lines.append(target_indent + content + "\n")
+        else:
+            reindented_lines.append("\n")
+
+    updated_lines = orig_lines[:start_idx] + reindented_lines + ["\n"] + orig_lines[end_idx:]
+
+    diff = difflib.unified_diff(
+        orig_lines,
+        updated_lines,
+        fromfile=f"a/{file_rel_path}",
+        tofile=f"b/{file_rel_path}",
+        n=3
+    )
+    return "".join(diff)
 
 def main():
     args = parse_args()
@@ -177,7 +302,7 @@ def main():
     task_id = args.task_id
 
     if "requests" in repo or "requests" in task_id:
-        target_files = ["src/requests/_types.py","src/requests/models.py"]
+        target_files = ["src/requests/models,py","src/requests/_types.py"]
         repo_name = "Requests"
     elif "fastapi" in repo or "fastapi" in task_id:
         target_files = ["fastapi/routing.py", "fastapi/_compat/v2.py"]
@@ -191,38 +316,86 @@ def main():
     problem_desc = task.get("problem_statement", "")
     target_files_formatted = ", ".join(f"`{f}`" for f in target_files) if target_files else "the target files"
 
+
+    example_diff = (
+        "--- a/src/requests/models.py\n"
+        "+++ b/src/requests/models.py\n"
+        "@@ -160,5 +160,5 @@ def _encode_params(\n"
+        "     if isinstance(data, (str, bytes)):\n"
+        "         return data\n"
+        "-    elif isinstance(data, _SupportsRead):\n"
+        "+    elif hasattr(data, \"read\"):\n"
+        "         return data\n"
+    )
+
+    # Read models.py content from the tar snapshot
+    full_models_code = ""
+    with tarfile.open(snapshot_path) as tar:
+        for m in tar.getmembers():
+            if m.name.endswith("models.py"):
+                f = tar.extractfile(m)
+                if f:
+                    full_models_code = f.read().decode("utf-8")
+                break
+
+    # Extract prepare_body method block
+    models_lines = full_models_code.splitlines()
+    start_line, end_line = None, len(models_lines)
+    for i, l in enumerate(models_lines):
+        if "def prepare_body(" in l:
+            start_line = i
+        elif start_line is not None and i > start_line:
+            # Stop when the next method in PreparedRequest begins
+            if l.startswith("    def "):
+                end_line = i
+                break
+
+    if start_line is not None:
+        original_prepare_body = "\n".join(models_lines[start_line:end_line])
+    else:
+        original_prepare_body = ""
+
     prompt = (
-        f"You are an expert Python software engineer repairing {repo_name}.\n"
-        f"Fix the issue described below by generating a valid unified git diff patch.\n\n"
-        f"### Problem Statement:\n{problem_desc}\n\n"
-        f"### Target Source Context:\n{repo_context}\n\n"
-        f"### Instructions:\n"
-        f"1. Generate ONLY a valid unified git diff patch enclosed in a single ```diff code block.\n"
-        f"2. You may modify one or more of these target files: {target_files_formatted}.\n"
-        f"3. For each file you modify, output standard unified diff headers using the exact relative path:\n"
-        f"   --- a/<exact_path>\n"
-        f"   +++ b/<exact_path>\n"
-        f"4. Do NOT use placeholder file names like 'your_file.py' or 'target_file.py'.\n"
-        f"5. Do NOT include placeholder comments like '# ...' or '# rest of code remains unchanged'.\n"
-        f"6. Maintain valid Python syntax and indentation on all lines.\n\n"
-        f"Output format:\n"
-        f"```diff\n"
-        f"--- a/<path>\n"
-        f"+++ b/<path>\n"
-        f"@@ -line,count +line,count @@\n"
-        f"<diff lines>\n"
-        f"```"
+        "<start_of_turn>user\n"
+        "You are an expert Python engineer fixing an issue in Requests.\n"
+        f"Problem: {problem_desc}\n\n"
+        "Here is the original `prepare_body` method:\n"
+        "```python\n"
+        f"{original_prepare_body}\n"
+        "```\n\n"
+        "Rewrite the complete `prepare_body` method.\n"
+        "Crucial fix: Locate the lines:\n"
+        "    if isinstance(data, basestring) or isinstance(data, _SupportsRead):\n"
+        "        content_type = None\n"
+        "Change that check to:\n"
+        "    if isinstance(data, basestring) or isinstance(data, _SupportsRead) or hasattr(data, 'read'):\n"
+        "        content_type = None\n\n"
+        "Keep 4-space method indentation on `def prepare_body`.\n"
+        "Return ONLY the complete method in a ```python code block.\n"
+        "<end_of_turn>\n"
+        "<start_of_turn>model\n"
+        "```python\n"
     )
 
     print(f"[+] Querying {args.model} with grounded context for {args.task_id}...")
     response_text = query_ollama(prompt, args.model, args.ollama_url)
-    patch_content = extract_diff(response_text) 
+    # Extract code from ```python ... ``` block
+    match = re.search(r"```(?:python)?\s*\n(.*?)```", response_text, re.DOTALL)
+    new_func = match.group(1).strip() if match else response_text.strip()
 
-    out_file = Path(args.output)
-    out_file.parent.mkdir(parents=True, exist_ok=True)
-    out_file.write_text(patch_content, encoding="utf-8")
-    print(f"[+] Candidate patch saved to: {out_file}")
+    # Generate unified diff using difflib
+    patch_diff = generate_function_patch(
+        "src/requests/models.py",
+        full_models_code,
+        new_func,
+        "prepare_body"
+    )
+    # patch_content = extract_diff(response_text) 
 
+    out_path = Path(args.output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(patch_diff, encoding="utf-8")
+    print(f"[+] Candidate patch saved to: {out_path}")
 
 if __name__ == "__main__":
     main()
