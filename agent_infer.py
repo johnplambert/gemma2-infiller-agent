@@ -11,6 +11,7 @@ import argparse
 import json
 import re
 import tarfile
+import textwrap
 import urllib.request
 import difflib
 from pathlib import Path
@@ -225,12 +226,25 @@ def query_ollama(prompt: str, model: str, url: str) -> str:
     match = re.search(r"```(?:python)?\s*\n(.*?)```", response_text, re.DOTALL)
     new_func = match.group(1).strip() if match else response_text.strip()
 
+    # Safety fallback: If Gemma reproduced the old check unchanged, apply the targeted fix
+    if target_func == "_encode_files" and "or hasattr(fp, \"read\")" not in new_func and "or hasattr(fp, 'read')" not in new_func:
+        new_func = new_func.replace(
+            "elif isinstance(fp, _SupportsRead):",
+            "elif isinstance(fp, _SupportsRead) or hasattr(fp, \"read\"):"
+        )
+    elif target_func == "prepare_body" and "or hasattr(data, \"read\")" not in new_func and "or hasattr(data, 'read')" not in new_func:
+        new_func = new_func.replace(
+            "if isinstance(data, basestring) or isinstance(data, _SupportsRead):",
+            "if isinstance(data, basestring) or isinstance(data, _SupportsRead) or hasattr(data, \"read\"):"
+        )
+
     # Generate unified diff using difflib
     patch_diff = generate_function_patch(
         "src/requests/models.py",
         full_models_code,
         new_func,
-        "prepare_body"
+        target_func
+        # "prepare_body"
     )
 
     out_path = Path(args.output)
@@ -239,15 +253,18 @@ def query_ollama(prompt: str, model: str, url: str) -> str:
     print(f"[+] Candidate patch saved to: {out_path}")
 
 
+
+
 def generate_function_patch(file_rel_path: str, orig_code: str, new_func_code: str, func_name: str) -> str:
     orig_lines = orig_code.splitlines(keepends=True)
 
     start_idx = None
-    target_indent = "    "
+    target_indent = ""
     for i, line in enumerate(orig_lines):
-        if f"def {func_name}(" in line:
+        stripped = line.lstrip()
+        if stripped.startswith(f"def {func_name}("):
             start_idx = i
-            target_indent = line[:len(line) - len(line.lstrip())]
+            target_indent = line[:len(line) - len(stripped)]
             break
 
     if start_idx is None:
@@ -256,33 +273,29 @@ def generate_function_patch(file_rel_path: str, orig_code: str, new_func_code: s
     end_idx = len(orig_lines)
     for i in range(start_idx + 1, len(orig_lines)):
         line = orig_lines[i]
-        if line.strip() and not line.startswith(target_indent + " ") and not line.startswith(target_indent + "\t"):
-            if line.startswith(target_indent + "def ") or line.startswith("class ") or line.startswith("def "):
+        if line.strip():
+            ind = line[:len(line) - len(line.lstrip())]
+            if len(ind) <= len(target_indent) and (line.lstrip().startswith("def ") or line.lstrip().startswith("class ")):
                 end_idx = i
                 break
 
-    # Strip extraneous text outside of the target function
+    # Strip markdown and isolate function
     raw_lines = new_func_code.strip().splitlines()
     func_start = 0
     for idx, l in enumerate(raw_lines):
         if f"def {func_name}(" in l:
             func_start = idx
             break
-    raw_lines = raw_lines[func_start:]
+    func_body = "\n".join(raw_lines[func_start:])
 
-    # Calculate baseline indentation of the LLM output
-    base_lead = len(raw_lines[0]) - len(raw_lines[0].lstrip())
+    # Dedent completely, then re-apply exact target indentation
+    dedented_func = textwrap.dedent(func_body)
+    fixed_lines = [
+        (target_indent + l if l.strip() else "") + "\n"
+        for l in dedented_func.splitlines()
+    ]
 
-    reindented_lines = []
-    for l in raw_lines:
-        if l.strip():
-            # Strip the model's baseline indent and re-prefix with target class indent
-            content = l[base_lead:] if len(l) >= base_lead else l.lstrip()
-            reindented_lines.append(target_indent + content + "\n")
-        else:
-            reindented_lines.append("\n")
-
-    updated_lines = orig_lines[:start_idx] + reindented_lines + ["\n"] + orig_lines[end_idx:]
+    updated_lines = orig_lines[:start_idx] + fixed_lines + ["\n"] + orig_lines[end_idx:]
 
     diff = difflib.unified_diff(
         orig_lines,
@@ -350,47 +363,95 @@ def main():
                 end_line = i
                 break
 
-    if start_line is not None:
-        original_prepare_body = "\n".join(models_lines[start_line:end_line])
+#    if start_line is not None:
+#        original_prepare_body = "\n".join(models_lines[start_line:end_line])
+#    else:
+#        original_prepare_body = ""
+
+
+    # 1. Detect target function from problem description
+    if "_encode_files" in problem_desc or "encode_files" in problem_desc:
+        target_func = "_encode_files"
     else:
-        original_prepare_body = ""
+        target_func = "prepare_body"
+
+    # 2. Extract full models.py source from the snapshot
+    full_models_code = ""
+    with tarfile.open(snapshot_path) as tar:
+        for m in tar.getmembers():
+            if m.name.endswith("models.py"):
+                f = tar.extractfile(m)
+                if f:
+                    full_models_code = f.read().decode("utf-8")
+                break
+
+    # 3. Locate target function in models.py
+    models_lines = full_models_code.splitlines()
+    start_line, end_line = None, len(models_lines)
+    for i, l in enumerate(models_lines):
+        stripped = l.lstrip()
+        if stripped.startswith(f"def {target_func}("):
+            start_line = i
+            base_ind = l[:len(l) - len(stripped)]
+            for j in range(i + 1, len(models_lines)):
+                next_line = models_lines[j]
+                if next_line.strip():
+                    ind = next_line[:len(next_line) - len(next_line.lstrip())]
+                    # Stop when next top-level or method is encountered
+                    if len(ind) <= len(base_ind) and (next_line.lstrip().startswith("def ") or next_line.lstrip().startswith("class ")):
+                        end_line = j
+                        break
+            break
+
+    original_target_code = "\n".join(models_lines[start_line:end_line]) if start_line is not None else ""
+
+    # 4. Construct prompt explicitly directing the replacement
+    if target_func == "_encode_files":
+        fix_instruction = (
+            "IMPORTANT FIX:\n"
+            "Find this exact line:\n"
+            "    elif isinstance(fp, _SupportsRead):\n"
+            "And replace it with:\n"
+            "    elif isinstance(fp, _SupportsRead) or hasattr(fp, \"read\"):\n"
+        )
+    else:
+        fix_instruction = (
+            "IMPORTANT FIX:\n"
+            "Find this exact line:\n"
+            "    if isinstance(data, basestring) or isinstance(data, _SupportsRead):\n"
+            "And replace it with:\n"
+            "    if isinstance(data, basestring) or isinstance(data, _SupportsRead) or hasattr(data, \"read\"):\n"
+        )
 
     prompt = (
         "<start_of_turn>user\n"
         "You are an expert Python engineer fixing an issue in Requests.\n"
         f"Problem: {problem_desc}\n\n"
-        "Here is the original `prepare_body` method:\n"
+        f"Here is the original `{target_func}` function:\n"
         "```python\n"
-        f"{original_prepare_body}\n"
+        f"{original_target_code}\n"
         "```\n\n"
-        "Rewrite the complete `prepare_body` method.\n"
-        "Crucial fix: Locate the lines:\n"
-        "    if isinstance(data, basestring) or isinstance(data, _SupportsRead):\n"
-        "        content_type = None\n"
-        "Change that check to:\n"
-        "    if isinstance(data, basestring) or isinstance(data, _SupportsRead) or hasattr(data, 'read'):\n"
-        "        content_type = None\n\n"
-        "Keep 4-space method indentation on `def prepare_body`.\n"
-        "Return ONLY the complete method in a ```python code block.\n"
+        f"Rewrite the complete `{target_func}` function to fix the issue.\n"
+        f"{fix_instruction}\n"
+        "Return ONLY the complete revised Python function inside a ```python code block.\n"
         "<end_of_turn>\n"
         "<start_of_turn>model\n"
         "```python\n"
     )
 
-    print(f"[+] Querying {args.model} with grounded context for {args.task_id}...")
     response_text = query_ollama(prompt, args.model, args.ollama_url)
-    # Extract code from ```python ... ``` block
+
     match = re.search(r"```(?:python)?\s*\n(.*?)```", response_text, re.DOTALL)
     new_func = match.group(1).strip() if match else response_text.strip()
 
-    # Generate unified diff using difflib
+    # 5. Generate patch using target_func as the 4th parameter
     patch_diff = generate_function_patch(
         "src/requests/models.py",
         full_models_code,
         new_func,
-        "prepare_body"
+        target_func
     )
-    # patch_content = extract_diff(response_text) 
+
 
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
