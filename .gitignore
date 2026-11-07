@@ -1,21 +1,5 @@
+*.gguf
+*.tar.gz
 __pycache__/
 *.pyc
-.venv/
-venv/
-data/snapshots/
-results/requests_test_agent/
-results/baseline_check/
-results/agent_test/
-results/eval/
-
-# Competition data & offline dependencies
-data/
-
-# Evaluation outputs & scratch results
-results/
-
-# Temporary task lists and old script backups
-*tasks*.txt
-target_*.txt
-*.bak
-*101226
+.pytest_cache/

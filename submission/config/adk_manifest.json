@@ -1,0 +1,21 @@
+{
+  "$schema": "https://raw.githubusercontent.com/google/adk/main/schemas/agent-manifest.json",
+  "name": "gemma2-infiller-agent",
+  "version": "1.0.0",
+  "description": "Autonomous code infilling agent powered by fine-tuned Gemma 2 2B",
+  "runtime": {
+    "type": "python",
+    "version": ">=3.10",
+    "entrypoint": "scripts/run_agent.sh"
+  },
+  "capabilities": [
+    "code_generation",
+    "code_infilling",
+    "autonomous_tool_use"
+  ],
+  "llm_backend": {
+    "engine": "ollama",
+    "model_tag": "gemma2-infiller",
+    "context_window": 8192
+  }
+}

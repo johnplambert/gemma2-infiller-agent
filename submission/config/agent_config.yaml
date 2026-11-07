@@ -1,0 +1,18 @@
+llm:
+  provider: "ollama"
+  model: "gemma2-infiller"
+  api_base: "http://localhost:11434/v1"
+  api_key: "ollama"
+  parameters:
+    temperature: 0.1
+    top_p: 0.95
+    max_tokens: 1024
+
+agent:
+  max_turns: 5
+  execution_timeout_seconds: 60
+  tools:
+    - name: "read_file"
+      description: "Reads contents of a file within the workspace."
+    - name: "apply_infill"
+      description: "Writes the infilled code implementation to the specified file."
